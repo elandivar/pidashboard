@@ -1,0 +1,11 @@
+#!/bin/sh
+xset -dpms
+xset s off
+xset s noblank
+
+xrandr --output HDMI-1 --mode 400x1280 --rotate right
+sleep 1
+
+openbox-session &
+sleep 1
+chromium --kiosk --noerrdialogs --disable-infobars --app=http://localhost:3000

@@ -1,0 +1,10 @@
+{
+  "panel_right": {
+    "type": "icon",
+    "value": "happy",
+    "title": "Mood",
+    "subtitle": "Set from OpenClaw"
+  },
+  "updated_at": "2026-03-17T15:30:00Z",
+  "source": "openclaw"
+}

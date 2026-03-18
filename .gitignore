@@ -1,0 +1,17 @@
+# Secrets & credentials
+config/client_secret.json
+config/digitalocean_config.json
+*.swp
+*.swo
+
+# Runtime state (generated at runtime)
+display_state.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# macOS
+.DS_Store
