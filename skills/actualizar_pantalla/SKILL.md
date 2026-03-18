@@ -1,7 +1,7 @@
 ---
-name: actualizar-pantalla
+name: actualizar_pantalla
 description: Actualiza el panel derecho del PiDashboard escribiendo display_state.json con un ícono, emoji o texto especificado por el usuario.
-user-invocable: true
+user-invokable: true
 metadata: {"openclaw":{"emoji":"🖥️","requires":{"bins":["python3"],"os":["linux","darwin"]}}}
 ---
 
@@ -33,7 +33,12 @@ El usuario quiere mostrar algo en la pantallita del Raspberry Pi: un ícono de e
 ## Workflow
 
 1. Interpreta el input del usuario y determina `type`, `value`, `title` y `subtitle`.
-2. Ejecuta el script de `write.py` con los valores resueltos.
+2. Ejecuta el siguiente comando con los valores resueltos:
+
+```bash
+python3 {baseDir}/write.py <type> <value> "<title>" "<subtitle>" /home/neomano/pidashboard/display_state.json
+```
+
 3. Responde con una confirmación de una línea.
 
-Ver detalles de implementación en `write.py`.
+Ver detalles de argumentos en `write.py`.
