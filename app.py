@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -10,7 +12,7 @@ from html import unescape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.error import URLError, HTTPError
 from urllib.request import Request, urlopen
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 HOST = "0.0.0.0"
 PORT = 3000
@@ -22,6 +24,11 @@ _btc_cache = {"ts": 0, "data": None, "last_ok_ts": 0, "fail_count": 0}
 BTC_CACHE_SECONDS_OK = 900
 BTC_CACHE_SECONDS_ERROR = 1800
 BTC_DAYS = 5
+_binance_cache = {"ts": 0, "data": None, "last_ok_ts": 0, "fail_count": 0}
+BINANCE_CACHE_SECONDS_OK = 1800
+BINANCE_CACHE_SECONDS_ERROR = 3600
+BINANCE_DAYS = 30
+BINANCE_CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config/binance_config.json")
 DISPLAY_STATE_PATH = os.environ.get(
     "PIDASHBOARD_STATE_FILE",
     os.path.join(APP_BASE_DIR, "display_state.json"),
@@ -498,6 +505,165 @@ def get_btc_history(days=BTC_DAYS):
         return stale_copy
     return _build_btc_payload([], updated_at=now, stale=True, error=f"BTC fetch failed: {last_error or 'unknown error'}", source="Kraken")
 
+
+
+def _read_binance_config():
+    try:
+        with open(BINANCE_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("api_key"), data.get("api_secret")
+    except Exception:
+        return None, None
+
+
+def _binance_signed_get(endpoint, params, api_key, api_secret):
+    params["timestamp"] = int(time.time() * 1000)
+    query_string = urlencode(sorted(params.items()))
+    sig = hmac.new(
+        api_secret.encode("utf-8"),
+        query_string.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    url = f"https://api.binance.com{endpoint}?{query_string}&signature={sig}"
+    req = Request(url, headers={
+        "X-MBX-APIKEY": api_key,
+        "User-Agent": "PiDashboard/1.0",
+        "Accept": "application/json",
+    })
+    with urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _fetch_btc_daily_prices_for_binance(days=35):
+    url = "https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=1440"
+    payload = _fetch_json(url, timeout=10)
+    errors = payload.get("error", [])
+    if errors:
+        raise ValueError("Kraken daily OHLC error: " + ", ".join(map(str, errors)))
+    result = payload.get("result", {})
+    series = None
+    for key, value in result.items():
+        if key != "last" and isinstance(value, list):
+            series = value
+            break
+    if not series:
+        raise ValueError("Kraken daily OHLC missing series")
+    cutoff = int(time.time()) - days * 86400
+    prices = {}
+    for candle in series:
+        if isinstance(candle, list) and len(candle) >= 5:
+            ts = int(float(candle[0]))
+            if ts >= cutoff:
+                prices[ts] = float(candle[4])
+    return prices
+
+
+def _fetch_binance_portfolio_history(days=BINANCE_DAYS):
+    api_key, api_secret = _read_binance_config()
+    if not api_key or not api_secret:
+        raise ValueError("Binance API credentials not configured")
+
+    payload = _binance_signed_get(
+        "/sapi/v1/accountSnapshot",
+        {"type": "SPOT", "limit": min(int(days), 30)},
+        api_key,
+        api_secret,
+    )
+
+    if payload.get("code") != 200:
+        raise ValueError(f"Binance snapshot error: {payload.get('msg', 'unknown')}")
+
+    snapshots = payload.get("snapshotVos", [])
+    if len(snapshots) < 2:
+        raise ValueError("Binance returned insufficient snapshot data")
+
+    btc_prices = _fetch_btc_daily_prices_for_binance(days + 5)
+    btc_price_list = sorted(btc_prices.items())
+
+    def closest_btc_usd(ts_ms):
+        ts_s = ts_ms // 1000
+        if not btc_price_list:
+            return None
+        best_ts, best_price = btc_price_list[0]
+        best_diff = abs(ts_s - best_ts)
+        for t, p in btc_price_list[1:]:
+            diff = abs(ts_s - t)
+            if diff < best_diff:
+                best_diff = diff
+                best_ts, best_price = t, p
+        return best_price
+
+    points = []
+    for snap in snapshots:
+        ts_ms = int(snap.get("updateTime", 0))
+        btc_value = float(snap.get("data", {}).get("totalAssetOfBtc", 0))
+        btc_price = closest_btc_usd(ts_ms)
+        if btc_price and btc_price > 0:
+            usd_value = round(btc_value * btc_price, 2)
+            points.append({"t": ts_ms, "p": usd_value})
+
+    if len(points) < 2:
+        raise ValueError("Could not compute USD values from Binance snapshots")
+
+    return sorted(points, key=lambda x: x["t"])
+
+
+def _build_binance_payload(points, updated_at, stale=False, error=None):
+    current_value = None
+    change_pct = None
+    min_value = None
+    max_value = None
+
+    if points:
+        values = [float(p["p"]) for p in points]
+        min_value = round(min(values), 2)
+        max_value = round(max(values), 2)
+        current_value = round(points[-1]["p"], 2)
+        prev = round(points[0]["p"], 2)
+        if prev:
+            change_pct = round(((current_value - prev) / prev) * 100.0, 2)
+
+    return {
+        "ok": len(points) > 1,
+        "current_value": current_value,
+        "change_pct": change_pct,
+        "min_value": min_value,
+        "max_value": max_value,
+        "days": BINANCE_DAYS,
+        "points": points,
+        "updated_at": int(updated_at),
+        "stale": stale,
+        "error": error,
+    }
+
+
+def get_binance_portfolio(days=BINANCE_DAYS):
+    now = time.time()
+    cached = _binance_cache.get("data")
+    age = now - _binance_cache.get("ts", 0)
+    min_cache_age = BINANCE_CACHE_SECONDS_ERROR if _binance_cache.get("fail_count", 0) > 0 else BINANCE_CACHE_SECONDS_OK
+
+    if cached is not None and age < min_cache_age:
+        return cached
+
+    try:
+        points = _fetch_binance_portfolio_history(days=days)
+        data = _build_binance_payload(points, updated_at=now, stale=False, error=None)
+        _binance_cache["ts"] = now
+        _binance_cache["last_ok_ts"] = now
+        _binance_cache["data"] = data
+        _binance_cache["fail_count"] = 0
+        return data
+    except (URLError, HTTPError, TimeoutError, ValueError, json.JSONDecodeError, OSError) as exc:
+        _binance_cache["ts"] = now
+        _binance_cache["fail_count"] = _binance_cache.get("fail_count", 0) + 1
+        if cached is not None:
+            stale_copy = dict(cached)
+            stale_copy["stale"] = True
+            stale_copy["error"] = f"Binance refresh failed: {type(exc).__name__}: {exc}"
+            _binance_cache["data"] = stale_copy
+            return stale_copy
+        return _build_binance_payload([], updated_at=now, stale=True, error=f"Binance fetch failed: {type(exc).__name__}: {exc}")
 
 
 def _copy_default_state():
@@ -1548,10 +1714,27 @@ HTML = r'''<!doctype html>
           </div>
 
           <div class="right">
-            <div class="card emoji-card">
-              <div class="panel-right-title" id="panel_right_title">Mood</div>
-              <div class="panel-right-stage" id="panel_right_stage"></div>
-              <div class="panel-right-subtitle" id="panel_right_subtitle">Controlled by display_state.json</div>
+            <div class="card chart-card">
+              <div class="chart-top">
+                <div>
+                  <div class="btc-title">Binance · últimos 30 días</div>
+                  <div class="btc-price" id="bnb_value">$--</div>
+                  <div class="btc-change muted" id="bnb_change">Cargando Binance...</div>
+                </div>
+                <div class="btc-meta">
+                  <div>Min: <span id="bnb_min">--</span></div>
+                  <div>Max: <span id="bnb_max">--</span></div>
+                </div>
+              </div>
+
+              <div class="chart-wrap">
+                <canvas id="bnb_chart"></canvas>
+              </div>
+
+              <div class="chart-footer">
+                <div class="pill">Binance / USD</div>
+                <div id="bnb_updated">cache 30 min</div>
+              </div>
             </div>
           </div>
         </div>
@@ -1646,10 +1829,12 @@ HTML = r'''<!doctype html>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
   <script>
     const chartCanvas = document.getElementById("btc_chart");
+    const bnbChartCanvas = document.getElementById("bnb_chart");
     const PAGES = document.getElementById("pages");
     const PAGE_ROTATE_MS = __PAGE_ROTATE_MS__;
     const ECUADOR_CENTER = { lat: __ECUADOR_LAT__, lng: __ECUADOR_LNG__, zoom: __ECUADOR_ZOOM__ };
     let lastGoodBtcPoints = [];
+    let lastGoodBnbPoints = [];
     let currentPage = 0;
     let lastDoData = [];
     let mapPage2 = null;
@@ -1753,6 +1938,120 @@ HTML = r'''<!doctype html>
       const label = "now";
       const m = ctx.measureText(label);
       ctx.fillText(label, w - pad.right - m.width, h - 6);
+    }
+
+    function drawBinanceChart(points) {
+      const canvas = bnbChartCanvas;
+      const ctx = canvas.getContext("2d");
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+      canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const w = rect.width;
+      const h = rect.height;
+      ctx.clearRect(0, 0, w, h);
+
+      const pad = { top: 16, right: 18, bottom: 24, left: 18 };
+      const cw = w - pad.left - pad.right;
+      const ch = h - pad.top - pad.bottom;
+
+      ctx.strokeStyle = "rgba(255,255,255,0.08)";
+      ctx.lineWidth = 1;
+      for (let i = 0; i < 4; i++) {
+        const y = pad.top + (ch / 3) * i;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(w - pad.right, y);
+        ctx.stroke();
+      }
+
+      if (!points || points.length < 2) {
+        ctx.fillStyle = "rgba(255,255,255,0.6)";
+        ctx.font = "14px Inter, sans-serif";
+        ctx.fillText("Sin datos de Binance", pad.left, pad.top + 18);
+        return;
+      }
+
+      const prices = points.map(p => Number(p.p));
+      const min = Math.min(...prices);
+      const max = Math.max(...prices);
+      const span = Math.max(1, max - min);
+      const xFor = (i) => pad.left + (i / (points.length - 1)) * cw;
+      const yFor = (price) => pad.top + ((max - price) / span) * ch;
+
+      ctx.beginPath();
+      for (let i = 0; i < points.length; i++) {
+        const x = xFor(i);
+        const y = yFor(points[i].p);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+
+      const gradient = ctx.createLinearGradient(0, pad.top, 0, pad.top + ch);
+      gradient.addColorStop(0, "rgba(240,185,11,0.95)");
+      gradient.addColorStop(1, "rgba(243,146,0,0.95)");
+      ctx.strokeStyle = gradient;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      ctx.lineTo(pad.left + cw, pad.top + ch);
+      ctx.lineTo(pad.left, pad.top + ch);
+      ctx.closePath();
+
+      const area = ctx.createLinearGradient(0, pad.top, 0, pad.top + ch);
+      area.addColorStop(0, "rgba(240,185,11,0.22)");
+      area.addColorStop(1, "rgba(243,146,0,0.03)");
+      ctx.fillStyle = area;
+      ctx.fill();
+
+      const last = points[points.length - 1];
+      const lx = xFor(points.length - 1);
+      const ly = yFor(last.p);
+      ctx.beginPath();
+      ctx.arc(lx, ly, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = "#fef3c7";
+      ctx.fill();
+
+      ctx.fillStyle = "rgba(255,255,255,0.55)";
+      ctx.font = "12px Inter, sans-serif";
+      ctx.fillText("30d ago", pad.left, h - 6);
+      const label = "hoy";
+      const m = ctx.measureText(label);
+      ctx.fillText(label, w - pad.right - m.width, h - 6);
+    }
+
+    async function refreshBinance() {
+      try {
+        const r = await fetch("/api/binance?ts=" + Math.floor(Date.now() / 1800000), { cache: "no-store" });
+        const d = await r.json();
+
+        if (d.ok && Array.isArray(d.points) && d.points.length > 1) {
+          lastGoodBnbPoints = d.points;
+          document.getElementById("bnb_value").textContent = formatUsd(d.current_value);
+          const changeEl = document.getElementById("bnb_change");
+          const change = Number(d.change_pct || 0);
+          changeEl.textContent = `30-day change: ${formatSignedPct(change)}`;
+          changeEl.className = "btc-change " + (change >= 0 ? "up" : "down");
+          document.getElementById("bnb_min").textContent = formatUsd(d.min_value);
+          document.getElementById("bnb_max").textContent = formatUsd(d.max_value);
+          drawBinanceChart(d.points);
+        } else {
+          document.getElementById("bnb_value").textContent = "$--";
+          const changeEl = document.getElementById("bnb_change");
+          changeEl.textContent = d.error || "Sin datos de Binance";
+          changeEl.className = "btc-change warning";
+          document.getElementById("bnb_min").textContent = "$--";
+          document.getElementById("bnb_max").textContent = "$--";
+          drawBinanceChart(lastGoodBnbPoints);
+        }
+
+        const updated = new Date((d.updated_at || 0) * 1000);
+        const suffix = d.stale ? " · mostrando cache" : " · cache 30 min";
+        document.getElementById("bnb_updated").textContent = `Binance ${updated.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}${suffix}`;
+      } catch (err) {
+        console.error("binance refresh failed", err);
+      }
     }
 
     function iconSvg(name) {
@@ -1892,11 +2191,6 @@ HTML = r'''<!doctype html>
     }
 
     function renderPanelRight(state) {
-      renderPanelRightTo(state, {
-        title: "panel_right_title",
-        stage: "panel_right_stage",
-        subtitle: "panel_right_subtitle"
-      });
       renderPanelRightTo(state, {
         title: "panel_right_title_p2",
         stage: "panel_right_stage_p2",
@@ -2239,21 +2533,25 @@ HTML = r'''<!doctype html>
 
     window.addEventListener("resize", () => {
       drawChart(lastGoodBtcPoints);
+      drawBinanceChart(lastGoodBnbPoints);
       if (mapPage2 && mapWasResized) mapPage2.invalidateSize();
       if (lastDoData && lastDoData.servers) renderDOServers(lastDoData);
     });
 
     drawChart([]);
+    drawBinanceChart([]);
     renderPanelRight({ panel_right: { type: "icon", value: "rocket", title: "Mood", subtitle: "Loading display state..." } });
     ensureMapPage2();
     startPageRotation();
     refreshMetrics();
     refreshBtc();
+    refreshBinance();
     refreshDisplayState();
     refreshEcuadorTrends();
     refreshDigitalOcean();
     setInterval(refreshMetrics, 4000);
     setInterval(refreshBtc, 60000);
+    setInterval(refreshBinance, 60000);
     setInterval(refreshDisplayState, __DISPLAY_STATE_POLL_SECONDS__ * 1000);
     setInterval(refreshEcuadorTrends, 60000);
     setInterval(refreshDigitalOcean, 60000);
@@ -2312,6 +2610,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path.startswith("/api/digitalocean"):
             self._send_json(get_digitalocean_metrics())
+            return
+
+        if self.path.startswith("/api/binance"):
+            self._send_json(get_binance_portfolio())
             return
 
         self._send_json({"error": "Not found"}, status=404)

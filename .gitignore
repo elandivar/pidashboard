@@ -1,6 +1,7 @@
 # Secrets & credentials
 config/client_secret.json
 config/digitalocean_config.json
+config/binance_config.json
 *.swp
 *.swo
 
