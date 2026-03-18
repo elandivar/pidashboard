@@ -659,7 +659,10 @@ def _fetch_do_json(path, token, timeout=DO_API_TIMEOUT):
             raw = response.read().decode("utf-8")
             data = json.loads(raw)
             result_count = len((((data or {}).get("data") or {}).get("result") or []))
-            print(f"[DO] GET {path[:80]} → {response.status} ({result_count} series)", flush=True)
+            if result_count == 0:
+                print(f"[DO] GET {path[:80]} → {response.status} (0 series) RAW={raw[:300]}", flush=True)
+            else:
+                print(f"[DO] GET {path[:80]} → {response.status} ({result_count} series)", flush=True)
             return data
     except HTTPError as exc:
         body = ""
